@@ -3,7 +3,9 @@ from .utils import *
 import sapien
 import math
 import glob
+import json
 import re
+from pathlib import Path
 from copy import deepcopy
 
 
@@ -29,6 +31,26 @@ class place_anyobject_stand(Base_Task):
                 rotate_lim=[0, np.pi / 3, 0],
             )
 
+        def _model_file_exists(modeldir, model_id):
+            """Check that at least one model geometry file (glb or obj) exists."""
+            modeldir = Path(modeldir)
+            candidates = [
+                modeldir / f"base{model_id}.glb",
+                modeldir / f"textured{model_id}.obj",
+                modeldir / "collision" / f"base{model_id}.glb",
+                modeldir / "collision" / f"textured{model_id}.obj",
+            ]
+            return any(c.exists() for c in candidates)
+
+        def _model_data_valid(json_path):
+            """Check that the JSON is loadable and contains the required 'scale' key."""
+            try:
+                with open(json_path, "r") as f:
+                    data = json.load(f)
+                return "scale" in data
+            except Exception:
+                return False
+
         def get_available_model_ids(modelname):
             asset_path = os.path.join("assets/objects", modelname)
             json_files = glob.glob(os.path.join(asset_path, "model_data*.json"))
@@ -38,9 +60,11 @@ class place_anyobject_stand(Base_Task):
                 base = os.path.basename(file)
                 try:
                     idx = int(base.replace("model_data", "").replace(".json", ""))
-                    available_ids.append(idx)
                 except ValueError:
                     continue
+                # Verify that the JSON is valid and the model geometry file exists
+                if _model_data_valid(file) and _model_file_exists(asset_path, idx):
+                    available_ids.append(idx)
 
             return available_ids
 
@@ -56,7 +80,7 @@ class place_anyobject_stand(Base_Task):
             for entry in sorted(os.listdir(objects_dir)):
                 full_path = os.path.join(objects_dir, entry)
                 if os.path.isdir(full_path) and pattern.match(entry) and entry not in excluded:
-                    # Only include objects that have at least one model_data*.json
+                    # Only include objects that have at least one fully valid model
                     if get_available_model_ids(entry):
                         object_names.append(entry)
 
@@ -76,6 +100,11 @@ class place_anyobject_stand(Base_Task):
             convex=True,
             model_id=self.selected_model_id,
         )
+        if self.object is None or self.object.config is None:
+            raise ValueError(
+                f"Failed to load object {self.selected_modelname} "
+                f"(model_id={self.selected_model_id}): actor or model data is None"
+            )
         self.object.set_mass(0.05)
 
         object_pos = self.object.get_pose()
