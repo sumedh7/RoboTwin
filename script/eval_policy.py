@@ -8,6 +8,7 @@ sys.path.append("./description/utils")
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
 
+import time
 import numpy as np
 from pathlib import Path
 from collections import deque
@@ -62,7 +63,10 @@ def get_embodiment_config(robot_file):
 
 
 def main(usr_args):
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Use the training run's start timestamp if provided (keeps eval videos
+    # grouped under the same directory as the run that triggered them).
+    current_time = usr_args.get("run_start_time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    eval_epoch = usr_args.get("eval_epoch")  # epoch number from training-time eval
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
@@ -121,7 +125,13 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    # Allow usr_args to override eval_video_log (useful for training-time eval)
+    if "eval_video_log" in usr_args:
+        args["eval_video_log"] = usr_args["eval_video_log"]
+
+    # Include epoch in directory name during training-time eval to avoid overwrites
+    time_label = f"{current_time}/epoch_{eval_epoch}" if eval_epoch is not None else current_time
+    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{time_label}")
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args["eval_video_log"]:
@@ -159,28 +169,39 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = usr_args.get("test_num", 100)
     topk = 1
 
+    eval_step_lim = usr_args.get("eval_step_lim", None)
+
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type)
+    st_seed, suc_num, episode_logs = eval_policy(task_name,
+                                                  TASK_ENV,
+                                                  args,
+                                                  model,
+                                                  st_seed,
+                                                  test_num=test_num,
+                                                  video_size=video_size,
+                                                  instruction_type=instruction_type,
+                                                  eval_step_lim=eval_step_lim)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
 
     file_path = os.path.join(save_dir, f"_result.txt")
     with open(file_path, "w") as file:
-        file.write(f"Timestamp: {current_time}\n\n")
-        file.write(f"Instruction Type: {instruction_type}\n\n")
-        # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        file.write(f"Timestamp: {current_time}\n")
+        if eval_epoch is not None:
+            file.write(f"Epoch: {eval_epoch}\n")
+        file.write(f"\nInstruction Type: {instruction_type}\n\n")
+        file.write(f"Success Rate: {suc_num}/{test_num}\n\n")
+        file.write("=" * 60 + "\n")
+        file.write("Per-Episode Details\n")
+        file.write("=" * 60 + "\n\n")
+        for log in episode_logs:
+            status = "SUCCESS" if log["success"] else "FAIL"
+            file.write(f"Episode {log['episode']} (seed={log['seed']}, steps={log['steps']}): {status}\n")
+            file.write(f"  Instruction: {log['instruction']}\n\n")
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -193,9 +214,13 @@ def eval_policy(task_name,
                 st_seed,
                 test_num=100,
                 video_size=None,
-                instruction_type=None):
+                instruction_type=None,
+                eval_step_lim=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
+    print(f"\033[34mEpisodes: {test_num}\033[0m")
+    if eval_step_lim is not None:
+        print(f"\033[34mStep limit override: {eval_step_lim}\033[0m")
 
     expert_check = True
     TASK_ENV.suc = 0
@@ -212,8 +237,10 @@ def eval_policy(task_name,
     now_seed = st_seed
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
+    episode_logs = []  # per-episode (instruction, success) records
 
     args["eval_mode"] = True
+    eval_start_time = time.time()
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -254,6 +281,11 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+
+        # Override step_lim if requested
+        if eval_step_lim is not None:
+            TASK_ENV.step_lim = eval_step_lim
+
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])
@@ -290,21 +322,33 @@ def eval_policy(task_name,
 
         succ = False
         reset_func(model)
+        ep_start_time = time.time()
+        print(f"\n--- Episode {TASK_ENV.test_num + 1}/{test_num} (seed={now_seed}, step_lim={TASK_ENV.step_lim}) ---")
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             eval_func(TASK_ENV, model, observation)
             if TASK_ENV.eval_success:
                 succ = True
                 break
+        ep_elapsed = time.time() - ep_start_time
+        final_step = TASK_ENV.take_action_cnt
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
         if succ:
             TASK_ENV.suc += 1
-            print("\033[92mSuccess!\033[0m")
+            print(f"\033[92mEpisode {TASK_ENV.test_num + 1}: Success at step {final_step}/{TASK_ENV.step_lim} ({ep_elapsed:.1f}s)\033[0m")
         else:
-            print("\033[91mFail!\033[0m")
+            print(f"\033[91mEpisode {TASK_ENV.test_num + 1}: Fail after {final_step}/{TASK_ENV.step_lim} steps ({ep_elapsed:.1f}s)\033[0m")
+
+        episode_logs.append({
+            "episode": TASK_ENV.test_num + 1,
+            "seed": now_seed,
+            "instruction": instruction,
+            "success": succ,
+            "steps": final_step,
+        })
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
@@ -321,7 +365,9 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    total_elapsed = time.time() - eval_start_time
+    print(f"\nAll {test_num} episodes finished in {total_elapsed:.1f}s")
+    return now_seed, TASK_ENV.suc, episode_logs
 
 
 def parse_args_and_config():

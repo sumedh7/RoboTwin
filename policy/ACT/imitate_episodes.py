@@ -1,12 +1,19 @@
 import os
+import sys
+import subprocess
+import re
+from datetime import timedelta
 
 # Set rendering backend for MuJoCo
 os.environ["MUJOCO_GL"] = "egl"
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import pickle
 import argparse
+import wandb
 
 import matplotlib
 
@@ -31,9 +38,64 @@ import IPython
 
 e = IPython.embed
 
+WANDB_ENTITY = "far-wandb"
+WANDB_PROJECT = "RoboTwin-conditioning"
+
+
+def is_distributed():
+    """Check if running in distributed mode (launched via torchrun)."""
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def get_rank():
+    if is_distributed():
+        return int(os.environ["RANK"])
+    return 0
+
+
+def get_local_rank():
+    if is_distributed():
+        return int(os.environ["LOCAL_RANK"])
+    return 0
+
+
+def get_world_size():
+    if is_distributed():
+        return int(os.environ["WORLD_SIZE"])
+    return 1
+
+
+def setup_ddp():
+    """Initialize distributed process group."""
+    if not is_distributed():
+        return
+    local_rank = get_local_rank()
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=4))
+    if get_rank() == 0:
+        print(f"DDP initialized: world_size={get_world_size()}")
+
+
+def cleanup_ddp():
+    """Destroy distributed process group."""
+    if is_distributed():
+        dist.destroy_process_group()
+
 
 def main(args):
     set_seed(1)
+
+    # Capture the training run start timestamp (used for wandb naming and eval video dirs)
+    from datetime import datetime
+    run_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Initialize DDP if launched via torchrun
+    distributed = is_distributed()
+    if distributed:
+        setup_ddp()
+    rank = get_rank()
+    local_rank = get_local_rank()
+
     # command line parameters
     is_eval = args["eval"]
     ckpt_dir = args["ckpt_dir"]
@@ -63,6 +125,9 @@ def main(args):
     state_dim = 14  # yiheng
     lr_backbone = 1e-5
     backbone = "resnet18"
+    lang_cond_type = args.get("lang_cond_type", "none") or "none"
+    instructions_dir = args.get("instructions_dir")
+
     if policy_class == "ACT":
         enc_layers = 4
         dec_layers = 7
@@ -79,6 +144,7 @@ def main(args):
             "dec_layers": dec_layers,
             "nheads": nheads,
             "camera_names": camera_names,
+            "lang_cond_type": lang_cond_type,
         }
     elif policy_class == "CNNMLP":
         policy_config = {
@@ -105,7 +171,15 @@ def main(args):
         "temporal_agg": args["temporal_agg"],
         "camera_names": camera_names,
         "real_robot": not is_sim,
-        "save_freq": args['save_freq']
+        "save_freq": args['save_freq'],
+        "distributed": distributed,
+        "eval_task_name": args.get("eval_task_name"),
+        "eval_task_config": args.get("eval_task_config", "demo_randomized"),
+        "eval_episodes": args.get("eval_episodes", 10),
+        "eval_step_lim": args.get("eval_step_lim"),
+        "lang_cond_type": lang_cond_type,
+        "instructions_dir": instructions_dir,
+        "run_start_time": run_start_time,
     }
 
     if is_eval:
@@ -120,22 +194,66 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
-                                                           batch_size_val)
+    # Initialize wandb on rank 0
+    if rank == 0:
+        wandb_config = {
+            "task_name": task_name,
+            "policy_class": policy_class,
+            "batch_size": batch_size_train,
+            "num_epochs": num_epochs,
+            "lr": args["lr"],
+            "seed": args["seed"],
+            "chunk_size": args.get("chunk_size"),
+            "kl_weight": args.get("kl_weight"),
+            "hidden_dim": args.get("hidden_dim"),
+            "dim_feedforward": args.get("dim_feedforward"),
+            "backbone": backbone,
+            "state_dim": state_dim,
+            "num_episodes": num_episodes,
+            "camera_names": camera_names,
+            "distributed": distributed,
+            "world_size": get_world_size(),
+            "effective_batch_size": batch_size_train * get_world_size(),
+        }
+        wandb_config["run_start_time"] = run_start_time
+        wandb.init(
+            entity=WANDB_ENTITY,
+            project=WANDB_PROJECT,
+            name=f"{task_name}_seed{args['seed']}_{run_start_time}",
+            config=wandb_config,
+            reinit=True,
+        )
 
-    # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    stats_path = os.path.join(ckpt_dir, f"dataset_stats.pkl")
-    with open(stats_path, "wb") as f:
-        pickle.dump(stats, f)
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir, num_episodes, camera_names, batch_size_train,
+        batch_size_val, distributed=distributed,
+        instructions_dir=instructions_dir, lang_cond_type=lang_cond_type,
+    )
+
+    # save dataset stats (rank 0 only)
+    if rank == 0:
+        if not os.path.isdir(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        stats_path = os.path.join(ckpt_dir, f"dataset_stats.pkl")
+        with open(stats_path, "wb") as f:
+            pickle.dump(stats, f)
+
+    # synchronize before training so all ranks see the saved stats
+    if distributed:
+        dist.barrier()
+
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f"policy_best.ckpt")
-    torch.save(best_state_dict, ckpt_path)
-    print(f"Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}")
+    # save best checkpoint (rank 0 only)
+    if rank == 0:
+        ckpt_path = os.path.join(ckpt_dir, f"policy_best.ckpt")
+        torch.save(best_state_dict, ckpt_path)
+        print(f"Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}")
+        wandb.finish()
+
+    if distributed:
+        cleanup_ddp()
 
 
 def make_policy(policy_class, policy_config):
@@ -343,15 +461,118 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
+def run_eval_subprocess(ckpt_dir, eval_task_name, eval_task_config, eval_episodes,
+                        temporal_agg, eval_step_lim=None, seed=0, gpu_id=0,
+                        run_start_time=None, lang_cond_type=None, lang_dim=None,
+                        epoch=None):
+    """Run evaluation as a subprocess using eval_policy.py and return success rate.
+
+    This reuses the same eval infrastructure as eval.sh, spawning a separate
+    process so that SAPIEN environment setup doesn't interfere with training.
+    Output is streamed live so timestep progress and episode results are visible.
+    """
+    # Determine repo root (this file lives at policy/ACT/)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, "../.."))
+
+    # ckpt_dir must be absolute so the subprocess can find it
+    abs_ckpt_dir = os.path.abspath(ckpt_dir)
+
+    cmd = [
+        sys.executable, "-u", "script/eval_policy.py",
+        "--config", "policy/ACT/deploy_policy.yml",
+        "--overrides",
+        "--task_name", eval_task_name,
+        "--task_config", eval_task_config,
+        "--ckpt_setting", eval_task_config,
+        "--ckpt_dir", abs_ckpt_dir,
+        "--seed", str(seed),
+        "--test_num", str(eval_episodes),
+        "--eval_video_log", "True",
+    ]
+    if temporal_agg:
+        cmd.extend(["--temporal_agg", "true"])
+    if eval_step_lim is not None:
+        cmd.extend(["--eval_step_lim", str(eval_step_lim)])
+    if run_start_time is not None:
+        cmd.extend(["--run_start_time", run_start_time])
+    if lang_cond_type and lang_cond_type != "none":
+        cmd.extend(["--lang_cond_type", lang_cond_type])
+    if lang_dim is not None:
+        cmd.extend(["--lang_dim", str(lang_dim)])
+    if epoch is not None:
+        cmd.extend(["--eval_epoch", str(epoch)])
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["MUJOCO_GL"] = "egl"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print(f"\n{'='*60}")
+    print(f"Running evaluation: {eval_episodes} episodes on {eval_task_name}")
+    print(f"Checkpoint dir: {abs_ckpt_dir}")
+    if eval_step_lim is not None:
+        print(f"Step limit per episode: {eval_step_lim}")
+    print(f"{'='*60}\n", flush=True)
+
+    collected_output = []
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=repo_root, env=env,
+        )
+
+        # Stream output line-by-line so the user sees progress in real time
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            print(line, flush=True)
+            collected_output.append(line)
+
+        proc.wait(timeout=7200)
+
+        full_output = "\n".join(collected_output)
+        # Strip ANSI colour codes before parsing
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        clean_output = ansi_escape.sub('', full_output)
+
+        # Parse the last "Success rate: X/Y" line (printed after every episode)
+        matches = re.findall(r'Success rate: (\d+)/(\d+)', clean_output)
+        if matches:
+            successes, total = int(matches[-1][0]), int(matches[-1][1])
+            success_rate = successes / total if total > 0 else 0.0
+            print(f"\nEvaluation complete: {successes}/{total} = {success_rate*100:.1f}%")
+            return success_rate
+        else:
+            print("Warning: Could not parse eval results from output")
+            if proc.returncode != 0:
+                print(f"Eval process exited with code {proc.returncode}")
+            return None
+    except subprocess.TimeoutExpired:
+        print("Warning: Evaluation timed out")
+        proc.kill()
+        return None
+    except Exception as exc:
+        print(f"Warning: Evaluation failed with error: {exc}")
+        return None
+
+
+def forward_pass(data, policy, device=None):
+    if len(data) == 5:
+        image_data, qpos_data, action_data, is_pad, lang_embed = data
+    else:
+        image_data, qpos_data, action_data, is_pad = data
+        lang_embed = None
+    if device is None:
+        device = torch.device("cuda")
     image_data, qpos_data, action_data, is_pad = (
-        image_data.cuda(),
-        qpos_data.cuda(),
-        action_data.cuda(),
-        is_pad.cuda(),
+        image_data.to(device),
+        qpos_data.to(device),
+        action_data.to(device),
+        is_pad.to(device),
     )
-    return policy(qpos_data, image_data, action_data, is_pad)  # TODO remove None
+    if lang_embed is not None:
+        lang_embed = lang_embed.to(device)
+    return policy(qpos_data, image_data, action_data, is_pad, lang_embed=lang_embed)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -360,26 +581,45 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config["seed"]
     policy_class = config["policy_class"]
     policy_config = config["policy_config"]
+    distributed = config.get("distributed", False)
+
+    rank = get_rank()
+    local_rank = get_local_rank()
 
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
+    device = torch.device(f"cuda:{local_rank}" if distributed else "cuda")
+    policy.to(device)
     optimizer = make_optimizer(policy_class, policy)
+
+    # Wrap with DDP for multi-GPU training
+    if distributed:
+        ddp_policy = DDP(policy, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    else:
+        ddp_policy = policy
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
 
-    for epoch in tqdm(range(num_epochs)):
-        print(f"\nEpoch {epoch}")
+    epoch_iter = tqdm(range(num_epochs)) if rank == 0 else range(num_epochs)
+    for epoch in epoch_iter:
+        if rank == 0:
+            print(f"\nEpoch {epoch}")
+
+        # Set epoch for distributed sampler (ensures proper shuffling each epoch)
+        if distributed:
+            train_dataloader.sampler.set_epoch(epoch)
+            val_dataloader.sampler.set_epoch(epoch)
+
         # validation
         with torch.inference_mode():
-            policy.eval()
+            ddp_policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, ddp_policy, device)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
@@ -387,17 +627,20 @@ def train_bc(train_dataloader, val_dataloader, config):
             epoch_val_loss = epoch_summary["loss"]
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
-        print(f"Val loss:   {epoch_val_loss:.5f}")
-        summary_string = ""
-        for k, v in epoch_summary.items():
-            summary_string += f"{k}: {v.item():.3f} "
+                # Save state_dict from the unwrapped policy (without DDP "module." prefix)
+                unwrapped = ddp_policy.module if distributed else ddp_policy
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(unwrapped.state_dict()))
+        if rank == 0:
+            print(f"Val loss:   {epoch_val_loss:.5f}")
+            summary_string = ""
+            for k, v in epoch_summary.items():
+                summary_string += f"{k}: {v.item():.3f} "
 
         # training
-        policy.train()
+        ddp_policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
+            forward_dict = forward_pass(data, ddp_policy, device)
             # backward
             loss = forward_dict["loss"]
             loss.backward()
@@ -406,26 +649,71 @@ def train_bc(train_dataloader, val_dataloader, config):
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
         epoch_train_loss = epoch_summary["loss"]
-        print(f"Train loss: {epoch_train_loss:.5f}")
-        summary_string = ""
-        for k, v in epoch_summary.items():
-            summary_string += f"{k}: {v.item():.3f} "
+        if rank == 0:
+            print(f"Train loss: {epoch_train_loss:.5f}")
+            summary_string = ""
+            for k, v in epoch_summary.items():
+                summary_string += f"{k}: {v.item():.3f} "
 
-        if (epoch + 1) % config['save_freq'] == 0:
+            # Log to wandb
+            wandb_log = {"epoch": epoch}
+            for k, v in epoch_summary.items():
+                wandb_log[f"train/{k}"] = v.item()
+            val_summary = validation_history[-1]
+            for k, v in val_summary.items():
+                wandb_log[f"val/{k}"] = v.item()
+            wandb_log["val/best_loss"] = min_val_loss.item() if hasattr(min_val_loss, 'item') else float(min_val_loss)
+            wandb.log(wandb_log, step=epoch)
+
+        if (epoch + 1) % config['save_freq'] == 0 and rank == 0:
+            unwrapped = ddp_policy.module if distributed else ddp_policy
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch + 1}_seed_{seed}.ckpt")
-            torch.save(policy.state_dict(), ckpt_path)
+            torch.save(unwrapped.state_dict(), ckpt_path)
+
+            # Also save as policy_last.ckpt (used by the eval/deploy pipeline)
+            last_ckpt_path = os.path.join(ckpt_dir, "policy_last.ckpt")
+            torch.save(unwrapped.state_dict(), last_ckpt_path)
+
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
-    torch.save(policy.state_dict(), ckpt_path)
+            # Run evaluation if configured
+            eval_task_name = config.get('eval_task_name')
+            if eval_task_name:
+                success_rate = run_eval_subprocess(
+                    ckpt_dir=ckpt_dir,
+                    eval_task_name=eval_task_name,
+                    eval_task_config=config.get('eval_task_config', 'demo_randomized'),
+                    eval_episodes=config.get('eval_episodes', 10),
+                    temporal_agg=config.get('temporal_agg', False),
+                    eval_step_lim=config.get('eval_step_lim'),
+                    seed=0,
+                    gpu_id=local_rank,
+                    run_start_time=config.get('run_start_time'),
+                    lang_cond_type=config.get('lang_cond_type'),
+                    lang_dim=config.get('policy_config', {}).get('lang_dim'),
+                    epoch=epoch + 1,
+                )
+                if success_rate is not None:
+                    wandb.log({"eval/success_rate": success_rate}, step=epoch)
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{best_epoch}_seed_{seed}.ckpt")
-    torch.save(best_state_dict, ckpt_path)
-    print(f"Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}")
+        # Synchronize all ranks after checkpoint saving / eval so that non-zero
+        # ranks don't race ahead into the next epoch's DDP collectives while
+        # rank 0 is still busy (which would cause an NCCL timeout).
+        if distributed:
+            dist.barrier()
 
-    # save training curves
-    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    if rank == 0:
+        unwrapped = ddp_policy.module if distributed else ddp_policy
+        ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
+        torch.save(unwrapped.state_dict(), ckpt_path)
+
+        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+        ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{best_epoch}_seed_{seed}.ckpt")
+        torch.save(best_state_dict, ckpt_path)
+        print(f"Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}")
+
+        # save training curves
+        plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
 
     return best_ckpt_info
 
@@ -487,5 +775,22 @@ if __name__ == "__main__":
         required=False,
     )
     parser.add_argument("--temporal_agg", action="store_true")
+
+    # Language conditioning
+    parser.add_argument("--lang_cond_type", type=str, default="none",
+                        choices=["none", "film", "token"],
+                        help="Language conditioning variant (default: none)")
+    parser.add_argument("--instructions_dir", type=str, default=None,
+                        help="Path to directory with per-episode instruction JSON files")
+
+    # Evaluation during training (optional)
+    parser.add_argument("--eval_task_name", type=str, default=None,
+                        help="Task name for eval (e.g. place_object_stand). If set, eval runs every save_freq epochs.")
+    parser.add_argument("--eval_task_config", type=str, default="demo_randomized",
+                        help="Task config yml name for eval (default: demo_randomized)")
+    parser.add_argument("--eval_episodes", type=int, default=10,
+                        help="Number of eval episodes to run (default: 10)")
+    parser.add_argument("--eval_step_lim", type=int, default=None,
+                        help="Max timesteps per eval episode (default: use task-specific limit)")
 
     main(vars(parser.parse_args()))

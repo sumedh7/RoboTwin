@@ -101,13 +101,83 @@ class Backbone(BackboneBase):
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
 
+class FiLMGenerator(nn.Module):
+    """Generate per-layer FiLM parameters (gamma, beta) from a language embedding."""
+
+    def __init__(self, lang_dim: int, channel_list: List[int]):
+        super().__init__()
+        self.projections = nn.ModuleList([
+            nn.Linear(lang_dim, ch * 2) for ch in channel_list
+        ])
+
+    def forward(self, lang_embed):
+        """Return list of (gamma, beta) tuples, one per ResNet stage."""
+        film_params = []
+        for proj in self.projections:
+            params = proj(lang_embed)                  # (B, ch*2)
+            gamma, beta = params.chunk(2, dim=-1)      # each (B, ch)
+            film_params.append((gamma, beta))
+        return film_params
+
+
+class FiLMBackbone(nn.Module):
+    """ResNet backbone with FiLM conditioning applied after each stage."""
+
+    def __init__(self, name: str, train_backbone: bool, dilation: bool, lang_dim: int):
+        super().__init__()
+        resnet = getattr(torchvision.models, name)(
+            replace_stride_with_dilation=[False, False, dilation],
+            pretrained=is_main_process(),
+            norm_layer=FrozenBatchNorm2d,
+        )
+        self.num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
+        channel_list = [64, 128, 256, self.num_channels] if name in ('resnet18', 'resnet34') \
+            else [256, 512, 1024, self.num_channels]
+
+        # Expose individual stages so we can apply FiLM between them
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.film_gen = FiLMGenerator(lang_dim, channel_list)
+
+    def forward(self, tensor, lang_embed=None):
+        x = self.conv1(tensor)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        if lang_embed is not None:
+            film_params = self.film_gen(lang_embed)
+        else:
+            film_params = [None] * 4
+
+        for stage, fp in zip([self.layer1, self.layer2, self.layer3, self.layer4], film_params):
+            x = stage(x)
+            if fp is not None:
+                gamma, beta = fp
+                # (1 + gamma) keeps identity at init (weights init near zero)
+                x = (1 + gamma.unsqueeze(-1).unsqueeze(-1)) * x + beta.unsqueeze(-1).unsqueeze(-1)
+
+        return OrderedDict({"0": x})
+
+
 class Joiner(nn.Sequential):
 
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
 
-    def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)
+    def forward(self, tensor_list, lang_embed=None):
+        backbone = self[0]
+        if isinstance(backbone, FiLMBackbone):
+            xs = backbone(tensor_list, lang_embed=lang_embed)
+        else:
+            xs = backbone(tensor_list)
         out: List[NestedTensor] = []
         pos = []
         for name, x in xs.items():
@@ -121,8 +191,15 @@ class Joiner(nn.Sequential):
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
-    return_interm_layers = args.masks
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    lang_cond_type = getattr(args, 'lang_cond_type', 'none') or 'none'
+
+    if lang_cond_type == "film":
+        lang_dim = getattr(args, 'lang_dim', 384)
+        backbone = FiLMBackbone(args.backbone, train_backbone, args.dilation, lang_dim)
+    else:
+        return_interm_layers = args.masks
+        backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

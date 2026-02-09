@@ -38,5 +38,15 @@
             "cam_right_wrist",
             "cam_left_wrist"
         ]
+    },
+    "sim-place_object_stand-demo_randomized-5000": {
+        "dataset_dir": "./processed_data/sim-place_object_stand/demo_randomized-5000",
+        "num_episodes": 5000,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high",
+            "cam_right_wrist",
+            "cam_left_wrist"
+        ]
     }
 }

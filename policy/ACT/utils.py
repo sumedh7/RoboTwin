@@ -1,17 +1,69 @@
+import json
 import numpy as np
 import torch
+import torch.distributed as dist
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 import IPython
 
 e = IPython.embed
 
+LANG_DIM = 384  # all-MiniLM-L6-v2 output dimension
+
+
+def _build_lang_embeddings_cache(instructions_dir, episode_ids, cache_path):
+    """Pre-compute sentence embeddings for all instructions and save to cache."""
+    from sentence_transformers import SentenceTransformer
+
+    print(f"Building language embedding cache for {len(episode_ids)} episodes...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    all_sentences = []
+    episode_offsets = {}  # episode_id -> (start, count)
+    for ep_id in sorted(episode_ids):
+        json_path = os.path.join(instructions_dir, f"episode{ep_id}.json")
+        if not os.path.isfile(json_path):
+            episode_offsets[ep_id] = None
+            continue
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        seen = data.get("seen", [])
+        if len(seen) == 0:
+            episode_offsets[ep_id] = None
+            continue
+        start = len(all_sentences)
+        all_sentences.extend(seen)
+        episode_offsets[ep_id] = (start, len(seen))
+
+    if len(all_sentences) > 0:
+        embeddings = model.encode(all_sentences, batch_size=256, show_progress_bar=True,
+                                  convert_to_numpy=True)  # (N, 384)
+        embeddings = torch.from_numpy(embeddings).float()
+    else:
+        embeddings = torch.zeros(0, LANG_DIM)
+
+    # Split back into per-episode tensors
+    cache = {}
+    for ep_id, offset_info in episode_offsets.items():
+        if offset_info is None:
+            cache[ep_id] = torch.zeros(1, LANG_DIM)  # fallback zero embedding
+        else:
+            start, count = offset_info
+            cache[ep_id] = embeddings[start:start + count]  # (count, 384)
+
+    torch.save(cache, cache_path)
+    print(f"Saved language embedding cache to {cache_path} ({len(cache)} episodes)")
+    del model
+    return cache
+
 
 class EpisodicDataset(torch.utils.data.Dataset):
 
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len,
+                 instructions_dir=None, lang_cond_type="none"):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -19,6 +71,23 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.max_action_len = max_action_len
         self.is_sim = None
+        self.lang_cond_type = lang_cond_type
+        self.lang_embeddings = None
+
+        # Pre-compute language embeddings if needed
+        if lang_cond_type != "none" and instructions_dir is not None:
+            cache_path = os.path.join(dataset_dir, "lang_embeddings_cache.pt")
+            if os.path.isfile(cache_path):
+                print(f"Loading language embedding cache from {cache_path}")
+                full_cache = torch.load(cache_path, map_location="cpu")
+                # Only keep episodes relevant to this split
+                self.lang_embeddings = {eid: full_cache[eid] for eid in episode_ids if eid in full_cache}
+            else:
+                # Need to build cache for ALL episodes (both train and val will share it)
+                all_ep_ids = list(range(max(episode_ids) + 1))
+                full_cache = _build_lang_embeddings_cache(instructions_dir, all_ep_ids, cache_path)
+                self.lang_embeddings = {eid: full_cache[eid] for eid in episode_ids if eid in full_cache}
+
         self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
@@ -75,6 +144,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
         image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+
+        if self.lang_embeddings is not None and episode_id in self.lang_embeddings:
+            embs = self.lang_embeddings[episode_id]  # (num_instructions, 384)
+            idx = np.random.randint(len(embs))
+            lang_embed = embs[idx]  # (384,)
+            return image_data, qpos_data, action_data, is_pad, lang_embed
 
         return image_data, qpos_data, action_data, is_pad
 
@@ -136,7 +211,8 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats, max_action_len
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+              distributed=False, instructions_dir=None, lang_cond_type="none"):
     print(f"\nData from: {dataset_dir}\n")
     # obtain train test split
     train_ratio = 0.8
@@ -147,25 +223,62 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # obtain normalization stats for qpos and action
     norm_stats, max_action_len = get_norm_stats(dataset_dir, num_episodes)
 
+    # In distributed mode, ensure the lang embedding cache is built by rank 0
+    # before any other rank tries to load it (avoids EOFError from partial writes).
+    if distributed and lang_cond_type != "none" and instructions_dir is not None:
+        cache_path = os.path.join(dataset_dir, "lang_embeddings_cache.pt")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if not os.path.isfile(cache_path):
+            if rank == 0:
+                all_ep_ids = list(range(num_episodes))
+                _build_lang_embeddings_cache(instructions_dir, all_ep_ids, cache_path)
+            # All ranks wait until rank 0 finishes writing the cache
+            dist.barrier()
+
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, max_action_len)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size_train,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size_val,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
-    )
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, max_action_len,
+                                    instructions_dir=instructions_dir, lang_cond_type=lang_cond_type)
+    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, max_action_len,
+                                  instructions_dir=instructions_dir, lang_cond_type=lang_cond_type)
+
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_train,
+            sampler=train_sampler,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=2,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size_val,
+            sampler=val_sampler,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=2,
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_train,
+            shuffle=True,
+            pin_memory=True,
+            num_workers=1,
+            prefetch_factor=1,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size_val,
+            shuffle=True,
+            pin_memory=True,
+            num_workers=1,
+            prefetch_factor=1,
+        )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 

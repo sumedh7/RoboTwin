@@ -29,9 +29,12 @@ class ACTPolicy(nn.Module):
         self.model = model  # CVAE decoder
         self.optimizer = optimizer
         self.kl_weight = args_override["kl_weight"]
+        self.lang_cond_type = args_override.get("lang_cond_type", "none") or "none"
         print(f"KL Weight {self.kl_weight}")
+        if self.lang_cond_type != "none":
+            print(f"Language conditioning: {self.lang_cond_type}")
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def forward(self, qpos, image, actions=None, is_pad=None, lang_embed=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         image = normalize(image)
@@ -39,7 +42,8 @@ class ACTPolicy(nn.Module):
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad)
+            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad,
+                                                          lang_embed=lang_embed)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction="none")
@@ -49,7 +53,7 @@ class ACTPolicy(nn.Module):
             loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
             return loss_dict
         else:  # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state)  # no action, sample from prior
+            a_hat, _, (_, _) = self.model(qpos, image, env_state, lang_embed=lang_embed)  # no action, sample from prior
             return a_hat
 
     def configure_optimizers(self):
@@ -64,7 +68,7 @@ class CNNMLPPolicy(nn.Module):
         self.model = model  # decoder
         self.optimizer = optimizer
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def forward(self, qpos, image, actions=None, is_pad=None):
         env_state = None  # TODO
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         image = normalize(image)
@@ -112,6 +116,14 @@ class ACT:
         self.device = torch.device(args_override["device"])
         self.policy.to(self.device)
         self.policy.eval()
+
+        # Language conditioning: load sentence encoder for runtime inference
+        self.lang_cond_type = args_override.get("lang_cond_type", "none") or "none"
+        self.lang_encoder = None
+        if self.lang_cond_type != "none":
+            from sentence_transformers import SentenceTransformer
+            self.lang_encoder = SentenceTransformer("all-MiniLM-L6-v2")
+            print(f"Loaded sentence encoder for lang_cond_type={self.lang_cond_type}")
 
         # Temporal aggregation settings
         self.temporal_agg = args_override.get("temporal_agg", False)
@@ -170,9 +182,26 @@ class ACT:
             return action * self.stats["action_std"] + self.stats["action_mean"]
         return action
 
-    def get_action(self, obs=None):
+    def encode_instruction(self, instruction):
+        """Encode an instruction string into a language embedding tensor."""
+        if self.lang_encoder is None or instruction is None:
+            return None
+        embedding = self.lang_encoder.encode([instruction], convert_to_numpy=True)  # (1, 384)
+        return torch.from_numpy(embedding).float().to(self.device)  # (1, 384)
+
+    def set_instruction(self, instruction):
+        """Cache a language embedding for the current episode."""
+        self._cached_lang_embed = self.encode_instruction(instruction)
+
+    def get_action(self, obs=None, instruction=None):
         if obs is None:
             return None
+
+        # Encode language instruction if provided, otherwise use cached embedding
+        if instruction is not None:
+            lang_embed = self.encode_instruction(instruction)
+        else:
+            lang_embed = self._cached_lang_embed
 
         # Convert observations to tensors and normalize qpos - matching imitate_episodes.py
         qpos_numpy = np.array(obs["qpos"])
@@ -191,7 +220,7 @@ class ACT:
         with torch.no_grad():
             # Only query the policy at specified intervals - exactly like imitate_episodes.py
             if self.t % self.query_frequency == 0:
-                self.all_actions = self.policy(qpos, curr_image)
+                self.all_actions = self.policy(qpos, curr_image, lang_embed=lang_embed)
 
             if self.temporal_agg:
                 # Match temporal aggregation exactly from imitate_episodes.py

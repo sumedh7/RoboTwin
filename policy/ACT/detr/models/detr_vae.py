@@ -36,7 +36,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
 
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names,
+                 lang_cond_type="none", lang_dim=384):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -45,12 +46,15 @@ class DETRVAE(nn.Module):
             num_queries: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+            lang_cond_type: "none", "film", or "token"
+            lang_dim: dimension of language embeddings (default 384 for MiniLM)
         """
         super().__init__()
         self.num_queries = num_queries
         self.camera_names = camera_names
         self.transformer = transformer
         self.encoder = encoder
+        self.lang_cond_type = lang_cond_type
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
@@ -77,14 +81,21 @@ class DETRVAE(nn.Module):
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
-        self.additional_pos_embed = nn.Embedding(2, hidden_dim)  # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+        # Language conditioning (token variant): project lang embedding + extra positional slot
+        if lang_cond_type == "token":
+            self.lang_proj = nn.Linear(lang_dim, hidden_dim)
+            self.additional_pos_embed = nn.Embedding(3, hidden_dim)  # latent + proprio + lang
+        else:
+            self.additional_pos_embed = nn.Embedding(2, hidden_dim)  # latent + proprio only
+
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, lang_embed=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
         env_state: None
         actions: batch, seq, action_dim
+        lang_embed: batch, lang_dim (optional language embedding)
         """
         is_training = actions is not None  # train or val
         bs, _ = qpos.shape
@@ -121,10 +132,12 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
-            # print("image.shape in detr_vae", image.shape,"camera_names", self.camera_names)
             for cam_id, cam_name in enumerate(self.camera_names):
-                # print("cam_id", cam_id, "cam_name", cam_name)
-                features, pos = self.backbones[0](image[:, cam_id])  # HARDCODED
+                # Pass lang_embed to backbone for FiLM conditioning
+                if self.lang_cond_type == "film" and lang_embed is not None:
+                    features, pos = self.backbones[0](image[:, cam_id], lang_embed=lang_embed)
+                else:
+                    features, pos = self.backbones[0](image[:, cam_id])
                 features = features[0]  # take the last layer feature
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -134,8 +147,14 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
+
+            # Language token conditioning
+            lang_input = None
+            if self.lang_cond_type == "token" and lang_embed is not None:
+                lang_input = self.lang_proj(lang_embed)  # (bs, hidden_dim)
+
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input,
-                                  self.additional_pos_embed.weight)[0]
+                                  self.additional_pos_embed.weight, lang_input=lang_input)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -243,6 +262,9 @@ def build(args):
 
     encoder = build_encoder(args)
 
+    lang_cond_type = getattr(args, 'lang_cond_type', 'none') or 'none'
+    lang_dim = getattr(args, 'lang_dim', 384)
+
     model = DETRVAE(
         backbones,
         transformer,
@@ -250,6 +272,8 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.chunk_size,  #gyh
         camera_names=args.camera_names,
+        lang_cond_type=lang_cond_type,
+        lang_dim=lang_dim,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

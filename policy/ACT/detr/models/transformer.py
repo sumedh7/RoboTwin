@@ -61,7 +61,8 @@ class Transformer(nn.Module):
                 pos_embed,
                 latent_input=None,
                 proprio_input=None,
-                additional_pos_embed=None):
+                additional_pos_embed=None,
+                lang_input=None):
         # TODO flatten only when input has H and W
         if len(src.shape) == 4:  # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -74,7 +75,10 @@ class Transformer(nn.Module):
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)  # seq, bs, dim
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
-            addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            if lang_input is not None:
+                addition_input = torch.stack([latent_input, proprio_input, lang_input], axis=0)
+            else:
+                addition_input = torch.stack([latent_input, proprio_input], axis=0)
             src = torch.cat([addition_input, src], axis=0)
         else:
             assert len(src.shape) == 3

@@ -8,6 +8,7 @@ ckpt_setting=${3}
 expert_data_num=${4}
 seed=${5}
 gpu_id=${6}
+shift 6 2>/dev/null  # consume the 6 positional args; remaining "$@" forwarded below
 # temporal_agg=${5} # use temporal_agg
 DEBUG=False
 
@@ -24,4 +25,5 @@ python script/eval_policy.py --config policy/$policy_name/deploy_policy.yml \
     --ckpt_setting ${ckpt_setting} \
     --ckpt_dir policy/ACT/act_ckpt/act-${task_name}/${ckpt_setting}-${expert_data_num} \
     --seed ${seed} \
-    --temporal_agg true
+    --temporal_agg true \
+    "$@"

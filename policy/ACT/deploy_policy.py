@@ -33,10 +33,10 @@ def get_model(usr_args):
 
 def eval(TASK_ENV, model, observation):
     obs = encode_obs(observation)
-    # instruction = TASK_ENV.get_instruction()
+    instruction = TASK_ENV.get_instruction()
 
-    # Get action from model
-    actions = model.get_action(obs)
+    # Get action from model (instruction is encoded internally by the ACT wrapper)
+    actions = model.get_action(obs, instruction=instruction)
     for action in actions:
         TASK_ENV.take_action(action)
         observation = TASK_ENV.get_obs()

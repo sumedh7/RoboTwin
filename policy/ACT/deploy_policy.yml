@@ -4,7 +4,7 @@ policy_name: ACT
 task_config: null
 ckpt_setting: null
 seed: 0
-instruction_type: unseen
+instruction_type: seen
 
 # ACT-specific arguments
 action_dim: 14
@@ -33,6 +33,10 @@ enc_layers: 4
 dec_layers: 7
 pre_norm: false
 dropout: 0.1
+# Language conditioning (override via --lang_cond_type film/token)
+lang_cond_type: none
+lang_dim: 384
+
 camera_names:
   - cam_high
   - cam_right_wrist

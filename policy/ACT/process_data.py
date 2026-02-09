@@ -2,6 +2,7 @@ import sys
 
 sys.path.append("./policy/ACT/")
 
+import gc
 import os
 import h5py
 import numpy as np
@@ -11,26 +12,33 @@ import argparse
 import pdb
 import json
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
-def load_hdf5(dataset_path):
+
+def load_hdf5_actions_only(dataset_path):
+    """Load only action/joint data (small). Caller must open file for image read."""
     if not os.path.isfile(dataset_path):
         print(f"Dataset does not exist at \n{dataset_path}\n")
         exit()
 
     with h5py.File(dataset_path, "r") as root:
-        left_gripper, left_arm = (
-            root["/joint_action/left_gripper"][()],
-            root["/joint_action/left_arm"][()],
-        )
-        right_gripper, right_arm = (
-            root["/joint_action/right_gripper"][()],
-            root["/joint_action/right_arm"][()],
-        )
-        image_dict = dict()
-        for cam_name in root[f"/observation/"].keys():
-            image_dict[cam_name] = root[f"/observation/{cam_name}/rgb"][()]
+        left_gripper = root["/joint_action/left_gripper"][()]
+        left_arm = root["/joint_action/left_arm"][()]
+        right_gripper = root["/joint_action/right_gripper"][()]
+        right_arm = root["/joint_action/right_arm"][()]
+    return left_gripper, left_arm, right_gripper, right_arm
 
-    return left_gripper, left_arm, right_gripper, right_arm, image_dict
+
+def read_frame_images(root, cam_names, j):
+    """Read a single frame from each camera (avoids loading full episode into memory)."""
+    return {
+        cam_name: root[f"/observation/{cam_name}/rgb"][j]
+        for cam_name in cam_names
+    }
 
 
 def images_encoding(imgs):
@@ -56,9 +64,13 @@ def data_transform(path, episode_num, save_path):
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
-    for i in range(episode_num):
-        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all, image_dict = (load_hdf5(
-            os.path.join(path, f"episode{i}.hdf5")))
+    # Map from our camera key names to dataset keys (if different)
+    cam_keys = ["head_camera", "right_camera", "left_camera"]
+
+    for i in tqdm(range(episode_num), desc="Episodes", unit="ep"):
+        episode_path = os.path.join(path, f"episode{i}.hdf5")
+        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all = load_hdf5_actions_only(episode_path)
+
         qpos = []
         actions = []
         cam_high = []
@@ -67,45 +79,37 @@ def data_transform(path, episode_num, save_path):
         left_arm_dim = []
         right_arm_dim = []
 
-        last_state = None
-        for j in range(0, left_gripper_all.shape[0]):
+        num_steps = left_gripper_all.shape[0]
+        state = None
 
-            left_gripper, left_arm, right_gripper, right_arm = (
-                left_gripper_all[j],
-                left_arm_all[j],
-                right_gripper_all[j],
-                right_arm_all[j],
-            )
+        # Open source file once and read images one frame at a time to limit memory
+        with h5py.File(episode_path, "r") as root:
+            for j in range(0, num_steps):
+                left_gripper = left_gripper_all[j]
+                left_arm = left_arm_all[j]
+                right_gripper = right_gripper_all[j]
+                right_arm = right_arm_all[j]
 
-            if j != left_gripper_all.shape[0] - 1:
-                state = np.concatenate((left_arm, [left_gripper], right_arm, [right_gripper]), axis=0)  # joint
+                if j != num_steps - 1:
+                    state = np.concatenate((left_arm, [left_gripper], right_arm, [right_gripper]), axis=0)
+                    state = state.astype(np.float32)
+                    qpos.append(state)
 
-                state = state.astype(np.float32)
-                qpos.append(state)
+                    # Read only this frame from disk (avoids loading full episode images)
+                    frame_bits = read_frame_images(root, cam_keys, j)
+                    camera_high = cv2.imdecode(np.frombuffer(frame_bits["head_camera"], np.uint8), cv2.IMREAD_COLOR)
+                    cam_high.append(cv2.resize(camera_high, (640, 480)))
+                    camera_right_wrist = cv2.imdecode(np.frombuffer(frame_bits["right_camera"], np.uint8), cv2.IMREAD_COLOR)
+                    cam_right_wrist.append(cv2.resize(camera_right_wrist, (640, 480)))
+                    camera_left_wrist = cv2.imdecode(np.frombuffer(frame_bits["left_camera"], np.uint8), cv2.IMREAD_COLOR)
+                    cam_left_wrist.append(cv2.resize(camera_left_wrist, (640, 480)))
 
-                camera_high_bits = image_dict["head_camera"][j]
-                camera_high = cv2.imdecode(np.frombuffer(camera_high_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_high_resized = cv2.resize(camera_high, (640, 480))
-                cam_high.append(camera_high_resized)
-
-                camera_right_wrist_bits = image_dict["right_camera"][j]
-                camera_right_wrist = cv2.imdecode(np.frombuffer(camera_right_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_right_wrist_resized = cv2.resize(camera_right_wrist, (640, 480))
-                cam_right_wrist.append(camera_right_wrist_resized)
-
-                camera_left_wrist_bits = image_dict["left_camera"][j]
-                camera_left_wrist = cv2.imdecode(np.frombuffer(camera_left_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_left_wrist_resized = cv2.resize(camera_left_wrist, (640, 480))
-                cam_left_wrist.append(camera_left_wrist_resized)
-
-            if j != 0:
-                action = state
-                actions.append(action)
-                left_arm_dim.append(left_arm.shape[0])
-                right_arm_dim.append(right_arm.shape[0])
+                if j != 0:
+                    actions.append(state)
+                    left_arm_dim.append(left_arm.shape[0])
+                    right_arm_dim.append(right_arm.shape[0])
 
         hdf5path = os.path.join(save_path, f"episode_{i}.hdf5")
-
         with h5py.File(hdf5path, "w") as f:
             f.create_dataset("action", data=np.array(actions))
             obs = f.create_group("observations")
@@ -113,15 +117,16 @@ def data_transform(path, episode_num, save_path):
             obs.create_dataset("left_arm_dim", data=np.array(left_arm_dim))
             obs.create_dataset("right_arm_dim", data=np.array(right_arm_dim))
             image = obs.create_group("images")
-            # cam_high_enc, len_high = images_encoding(cam_high)
-            # cam_right_wrist_enc, len_right = images_encoding(cam_right_wrist)
-            # cam_left_wrist_enc, len_left = images_encoding(cam_left_wrist)
             image.create_dataset("cam_high", data=np.stack(cam_high), dtype=np.uint8)
             image.create_dataset("cam_right_wrist", data=np.stack(cam_right_wrist), dtype=np.uint8)
             image.create_dataset("cam_left_wrist", data=np.stack(cam_left_wrist), dtype=np.uint8)
 
+        # Explicit cleanup so memory is freed before next episode (avoids blow-up over 1000s of episodes)
+        del qpos, actions, cam_high, cam_right_wrist, cam_left_wrist, left_arm_dim, right_arm_dim
+        del left_gripper_all, left_arm_all, right_gripper_all, right_arm_all
+        gc.collect()
+
         begin += 1
-        print(f"proccess {i} success!")
 
     return begin
 
