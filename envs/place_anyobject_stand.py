@@ -1,18 +1,35 @@
 from ._base_task import Base_Task
 from .utils import *
+from .utils.create_actor import UnStableError
 import sapien
 import math
 import glob
 import json
 import re
+import time
 from pathlib import Path
 from copy import deepcopy
+
+_MAX_STABLE_RETRIES = 5
 
 
 class place_anyobject_stand(Base_Task):
 
     def setup_demo(self, is_test=False, **kwags):
-        super()._init_task_env_(**kwags)
+        for attempt in range(_MAX_STABLE_RETRIES):
+            try:
+                super()._init_task_env_(**kwags)
+                return
+            except UnStableError as e:
+                if attempt < _MAX_STABLE_RETRIES - 1:
+                    print(f"  [place_anyobject_stand] Unstable object on attempt "
+                          f"{attempt + 1}/{_MAX_STABLE_RETRIES}: {e}  — retrying")
+                    self.close_env()
+                    time.sleep(0.1)
+                    # Bump the seed so the retry picks a different random pose / object
+                    kwags["seed"] = kwags.get("seed", 0) + 10000 * (attempt + 1)
+                else:
+                    raise
 
     def load_actors(self):
         rand_pos = rand_pose(
