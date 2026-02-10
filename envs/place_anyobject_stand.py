@@ -16,11 +16,6 @@ _MAX_STABLE_RETRIES = 5
 class place_anyobject_stand(Base_Task):
 
     def setup_demo(self, is_test=False, **kwags):
-<<<<<<< HEAD
-        for attempt in range(_MAX_STABLE_RETRIES):
-            try:
-                super()._init_task_env_(**kwags)
-=======
         original_seed = kwags.get("seed", 0)
         for attempt in range(_MAX_STABLE_RETRIES):
             try:
@@ -29,7 +24,6 @@ class place_anyobject_stand(Base_Task):
                 # that collect_data.py can persist it (instead of the original
                 # seed which may have been unstable).
                 self._effective_seed = kwags.get("seed", 0)
->>>>>>> dae3447 (parallelize data collect)
                 return
             except UnStableError as e:
                 if attempt < _MAX_STABLE_RETRIES - 1:
@@ -37,14 +31,9 @@ class place_anyobject_stand(Base_Task):
                           f"{attempt + 1}/{_MAX_STABLE_RETRIES}: {e}  — retrying")
                     self.close_env()
                     time.sleep(0.1)
-<<<<<<< HEAD
-                    # Bump the seed so the retry picks a different random pose / object
-                    kwags["seed"] = kwags.get("seed", 0) + 10000 * (attempt + 1)
-=======
                     # Bump the seed relative to the *original* so each retry
                     # gets a deterministic, non-overlapping seed.
                     kwags["seed"] = original_seed + 10000 * (attempt + 1)
->>>>>>> dae3447 (parallelize data collect)
                 else:
                     raise
 
