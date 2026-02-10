@@ -16,9 +16,20 @@ _MAX_STABLE_RETRIES = 5
 class place_anyobject_stand(Base_Task):
 
     def setup_demo(self, is_test=False, **kwags):
+<<<<<<< HEAD
         for attempt in range(_MAX_STABLE_RETRIES):
             try:
                 super()._init_task_env_(**kwags)
+=======
+        original_seed = kwags.get("seed", 0)
+        for attempt in range(_MAX_STABLE_RETRIES):
+            try:
+                super()._init_task_env_(**kwags)
+                # Record the seed that actually produced a stable scene so
+                # that collect_data.py can persist it (instead of the original
+                # seed which may have been unstable).
+                self._effective_seed = kwags.get("seed", 0)
+>>>>>>> dae3447 (parallelize data collect)
                 return
             except UnStableError as e:
                 if attempt < _MAX_STABLE_RETRIES - 1:
@@ -26,23 +37,32 @@ class place_anyobject_stand(Base_Task):
                           f"{attempt + 1}/{_MAX_STABLE_RETRIES}: {e}  — retrying")
                     self.close_env()
                     time.sleep(0.1)
+<<<<<<< HEAD
                     # Bump the seed so the retry picks a different random pose / object
                     kwags["seed"] = kwags.get("seed", 0) + 10000 * (attempt + 1)
+=======
+                    # Bump the seed relative to the *original* so each retry
+                    # gets a deterministic, non-overlapping seed.
+                    kwags["seed"] = original_seed + 10000 * (attempt + 1)
+>>>>>>> dae3447 (parallelize data collect)
                 else:
                     raise
 
     def load_actors(self):
+        # y-axis: negative = near robot, positive = toward wall.
+        # Use a wide range so the target is NOT always the nearest object
+        # to the robot — clutter may end up closer.
         rand_pos = rand_pose(
             xlim=[-0.28, 0.28],
-            ylim=[-0.05, 0.05],
+            ylim=[-0.1, 0.25],
             qpos=[0.707, 0.707, 0.0, 0.0],
             rotate_rand=True,
             rotate_lim=[0, np.pi / 3, 0],
         )
-        while abs(rand_pos.p[0]) < 0.2:
+        while abs(rand_pos.p[0]) < 0.15:
             rand_pos = rand_pose(
                 xlim=[-0.28, 0.28],
-                ylim=[-0.05, 0.05],
+                ylim=[-0.1, 0.25],
                 qpos=[0.707, 0.707, 0.0, 0.0],
                 rotate_rand=True,
                 rotate_lim=[0, np.pi / 3, 0],
@@ -60,11 +80,11 @@ class place_anyobject_stand(Base_Task):
             return any(c.exists() for c in candidates)
 
         def _model_data_valid(json_path):
-            """Check that the JSON is loadable and contains the required 'scale' key."""
+            """Check that the JSON is loadable and contains the keys needed for grasping."""
             try:
                 with open(json_path, "r") as f:
                     data = json.load(f)
-                return "scale" in data
+                return "scale" in data and "contact_points_pose" in data
             except Exception:
                 return False
 
@@ -125,21 +145,22 @@ class place_anyobject_stand(Base_Task):
         self.object.set_mass(0.05)
 
         object_pos = self.object.get_pose()
-        if object_pos.p[0] > 0:
-            xlim = [0.0, 0.05]
-        else:
-            xlim = [-0.05, 0.0]
+        # Place the display stand anywhere in a wide area, but keep a
+        # minimum separation from the object so the task is non-trivial.
+        stand_xlim = [-0.2, 0.2]
+        stand_ylim = [-0.1, 0.25]
+        min_sep_sq = 0.02  # ≈ 14 cm minimum separation
         target_rand_pos = rand_pose(
-            xlim=xlim,
-            ylim=[-0.15, -0.1],
+            xlim=stand_xlim,
+            ylim=stand_ylim,
             qpos=[0.707, 0.707, 0.0, 0.0],
             rotate_rand=True,
             rotate_lim=[0, np.pi / 6, 0],
         )
-        while ((object_pos.p[0] - target_rand_pos.p[0])**2 + (object_pos.p[1] - target_rand_pos.p[1])**2) < 0.01:
+        while ((object_pos.p[0] - target_rand_pos.p[0])**2 + (object_pos.p[1] - target_rand_pos.p[1])**2) < min_sep_sq:
             target_rand_pos = rand_pose(
-                xlim=xlim,
-                ylim=[-0.15, -0.1],
+                xlim=stand_xlim,
+                ylim=stand_ylim,
                 qpos=[0.707, 0.707, 0.0, 0.0],
                 rotate_rand=True,
                 rotate_lim=[0, np.pi / 6, 0],

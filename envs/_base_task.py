@@ -1200,6 +1200,9 @@ class Base_Task(gym.Env):
             target_dis=grasp_dis,
             contact_point_id=contact_point_id,
         )
+        if pre_grasp_pose is None or grasp_pose is None:
+            self.plan_success = False
+            return None, []
         if pre_grasp_pose == grasp_pose:
             return arm_tag, [
                 Action(arm_tag, "move", target_pose=pre_grasp_pose),
@@ -1335,6 +1338,9 @@ class Base_Task(gym.Env):
                 pre_dis=dis,
                 **args,
             )
+            if place_pre_pose is None or place_pose is None:
+                self.plan_success = False
+                return None, []
         else:
             place_pre_pose = [0, 0, 0, 0, 0, 0, 0]
             place_pose = [0, 0, 0, 0, 0, 0, 0]

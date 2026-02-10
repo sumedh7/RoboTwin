@@ -36,7 +36,8 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(task_name=None, task_config=None):
+def main(task_name=None, task_config=None, seed_start=0,
+         num_episodes=None, save_path_override=None, skip_instructions=False):
 
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
@@ -100,11 +101,20 @@ def main(task_name=None, task_config=None):
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
     args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
+
+    # CLI overrides for parallel sharding
+    if num_episodes is not None:
+        args["episode_num"] = num_episodes
+    if save_path_override is not None:
+        args["save_path"] = save_path_override
+    args["seed_start"] = seed_start
+    args["skip_instructions"] = skip_instructions
+
     run(task, args)
 
 
 def run(TASK_ENV, args):
-    epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    epid, suc_num, fail_num, seed_list = args.get("seed_start", 0), 0, 0, []
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -130,8 +140,12 @@ def run(TASK_ENV, args):
                 TASK_ENV.play_once()
 
                 if TASK_ENV.plan_success and TASK_ENV.check_success():
-                    print(f"simulate data episode {suc_num} success! (seed = {epid})")
-                    seed_list.append(epid)
+                    # Use the effective seed if setup_demo retried with a
+                    # different seed (e.g. after an UnStableError); otherwise
+                    # fall back to the original epid.
+                    effective = getattr(TASK_ENV, "_effective_seed", epid)
+                    print(f"simulate data episode {suc_num} success! (seed = {effective})")
+                    seed_list.append(effective)
                     TASK_ENV.save_traj_data(suc_num)
                     suc_num += 1
                 else:
@@ -229,8 +243,9 @@ def run(TASK_ENV, args):
             TASK_ENV.remove_data_cache()
             assert TASK_ENV.check_success(), "Collect Error"
 
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
-        os.system(command)
+        if not args.get("skip_instructions", False):
+            command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
+            os.system(command)
 
 
 if __name__ == "__main__":
@@ -243,8 +258,21 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
-    parser = parser.parse_args()
-    task_name = parser.task_name
-    task_config = parser.task_config
+    parser.add_argument("--seed-start", type=int, default=0,
+                        help="Starting seed ID (for parallel sharding)")
+    parser.add_argument("--num-episodes", type=int, default=None,
+                        help="Override episode_num from config")
+    parser.add_argument("--save-path", type=str, default=None,
+                        help="Override save_path from config")
+    parser.add_argument("--skip-instructions", action="store_true",
+                        help="Skip instruction generation (for parallel sharding)")
+    cli = parser.parse_args()
 
-    main(task_name=task_name, task_config=task_config)
+    main(
+        task_name=cli.task_name,
+        task_config=cli.task_config,
+        seed_start=cli.seed_start,
+        num_episodes=cli.num_episodes,
+        save_path_override=cli.save_path,
+        skip_instructions=cli.skip_instructions,
+    )
