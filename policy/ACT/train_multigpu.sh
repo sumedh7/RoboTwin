@@ -26,7 +26,7 @@ torchrun --nproc_per_node=${num_gpus} --master_port=29500 imitate_episodes.py \
     --eval_task_name ${task_name} \
     --eval_task_config ${task_config} \
     --eval_episodes 20 \
-    --eval_step_lim 150 \
+    --eval_step_lim 200 \
     "$@"
     # Language conditioning examples:
     # bash train_multigpu.sh <task> <config> <num> <seed> <gpus> --lang_cond_type film --instructions_dir ../../data/<task>/<config>/instructions

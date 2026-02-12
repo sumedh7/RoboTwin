@@ -11,6 +11,8 @@ import cv2
 import argparse
 import pdb
 import json
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 try:
     from tqdm import tqdm
@@ -56,8 +58,117 @@ def images_encoding(imgs):
     return encode_data, max_len
 
 
-def data_transform(path, episode_num, save_path):
-    begin = 0
+def process_single_episode(i, path, save_path, cam_keys):
+    """Process a single episode: read source HDF5, transform, and write output HDF5."""
+    episode_path = os.path.join(path, f"episode{i}.hdf5")
+    if not os.path.isfile(episode_path):
+        print(f"Dataset does not exist at \n{episode_path}\n")
+        exit()
+
+    # ---- READ PHASE: single file open, bulk-read everything ----------------
+    # Reading entire datasets at once ([:] / [()]) issues a few large
+    # sequential I/O ops instead of num_steps * 3 tiny random reads.
+    # This is the critical difference: HDF5 random indexing ([j]) goes through
+    # the full HDF5 I/O path per call, which becomes a bottleneck with many
+    # concurrent workers competing for disk bandwidth.
+    with h5py.File(episode_path, "r") as root:
+        left_gripper_all = root["/joint_action/left_gripper"][()]
+        left_arm_all = root["/joint_action/left_arm"][()]
+        right_gripper_all = root["/joint_action/right_gripper"][()]
+        right_arm_all = root["/joint_action/right_arm"][()]
+        # Bulk-read all frames per camera in one shot
+        head_imgs_all = root["/observation/head_camera/rgb"][()]
+        right_imgs_all = root["/observation/right_camera/rgb"][()]
+        left_imgs_all = root["/observation/left_camera/rgb"][()]
+    # HDF5 file is now closed — no file descriptor held during processing.
+
+    num_steps = left_gripper_all.shape[0]
+    n = num_steps - 1  # number of output frames
+    state_dim = left_arm_all.shape[1] + 1 + right_arm_all.shape[1] + 1
+
+    # Pre-allocate contiguous output arrays (avoids list resizing + np.stack copy)
+    qpos = np.empty((n, state_dim), dtype=np.float32)
+    actions = np.empty((n, state_dim), dtype=np.float32)
+    cam_high = np.empty((n, 480, 640, 3), dtype=np.uint8)
+    cam_right_wrist = np.empty((n, 480, 640, 3), dtype=np.uint8)
+    cam_left_wrist = np.empty((n, 480, 640, 3), dtype=np.uint8)
+    left_arm_dim = np.empty(n, dtype=np.int64)
+    right_arm_dim = np.empty(n, dtype=np.int64)
+
+    # ---- TRANSFORM PHASE: pure CPU work, no I/O ----------------------------
+    state = None
+    qi = 0  # index into qpos / image arrays
+    ai = 0  # index into actions / arm_dim arrays
+
+    for j in range(num_steps):
+        left_gripper = left_gripper_all[j]
+        left_arm = left_arm_all[j]
+        right_gripper = right_gripper_all[j]
+        right_arm = right_arm_all[j]
+
+        if j != num_steps - 1:
+            state = np.concatenate(
+                (left_arm, [left_gripper], right_arm, [right_gripper]), axis=0
+            ).astype(np.float32)
+            qpos[qi] = state
+
+            cam_high[qi] = cv2.resize(
+                cv2.imdecode(np.frombuffer(head_imgs_all[j], np.uint8), cv2.IMREAD_COLOR),
+                (640, 480),
+            )
+            cam_right_wrist[qi] = cv2.resize(
+                cv2.imdecode(np.frombuffer(right_imgs_all[j], np.uint8), cv2.IMREAD_COLOR),
+                (640, 480),
+            )
+            cam_left_wrist[qi] = cv2.resize(
+                cv2.imdecode(np.frombuffer(left_imgs_all[j], np.uint8), cv2.IMREAD_COLOR),
+                (640, 480),
+            )
+            qi += 1
+
+        if j != 0:
+            actions[ai] = state
+            left_arm_dim[ai] = left_arm.shape[0]
+            right_arm_dim[ai] = right_arm.shape[0]
+            ai += 1
+
+    # Free source data before writing
+    del head_imgs_all, right_imgs_all, left_imgs_all
+    del left_gripper_all, left_arm_all, right_gripper_all, right_arm_all
+
+    # ---- WRITE PHASE -------------------------------------------------------
+    # Image datasets are stored with gzip compression and per-frame chunking.
+    # Raw uint8 images compress ~10-20x, cutting total write volume from ~2TB
+    # to ~100-200GB for 5000 episodes.  This prevents the OS dirty-page cache
+    # from saturating and blocking all writes (the root cause of the slowdown).
+    # Per-frame chunks (1, H, W, 3) ensure efficient single-frame random access
+    # during training, since h5py only decompresses the one chunk needed.
+    IMG_CHUNKS = (1, 480, 640, 3)
+    IMG_COMPRESS = "gzip"
+    IMG_COMPRESS_LEVEL = 4
+
+    hdf5path = os.path.join(save_path, f"episode_{i}.hdf5")
+    with h5py.File(hdf5path, "w") as f:
+        f.create_dataset("action", data=actions)
+        obs = f.create_group("observations")
+        obs.create_dataset("qpos", data=qpos)
+        obs.create_dataset("left_arm_dim", data=left_arm_dim)
+        obs.create_dataset("right_arm_dim", data=right_arm_dim)
+        image = obs.create_group("images")
+        image.create_dataset("cam_high", data=cam_high,
+                             chunks=IMG_CHUNKS, compression=IMG_COMPRESS, compression_opts=IMG_COMPRESS_LEVEL)
+        image.create_dataset("cam_right_wrist", data=cam_right_wrist,
+                             chunks=IMG_CHUNKS, compression=IMG_COMPRESS, compression_opts=IMG_COMPRESS_LEVEL)
+        image.create_dataset("cam_left_wrist", data=cam_left_wrist,
+                             chunks=IMG_CHUNKS, compression=IMG_COMPRESS, compression_opts=IMG_COMPRESS_LEVEL)
+
+    del qpos, actions, cam_high, cam_right_wrist, cam_left_wrist, left_arm_dim, right_arm_dim
+    gc.collect()
+
+    return i
+
+
+def data_transform(path, episode_num, save_path, num_workers=1):
     floders = os.listdir(path)
     assert episode_num <= len(floders), "data num not enough"
 
@@ -67,68 +178,28 @@ def data_transform(path, episode_num, save_path):
     # Map from our camera key names to dataset keys (if different)
     cam_keys = ["head_camera", "right_camera", "left_camera"]
 
-    for i in tqdm(range(episode_num), desc="Episodes", unit="ep"):
-        episode_path = os.path.join(path, f"episode{i}.hdf5")
-        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all = load_hdf5_actions_only(episode_path)
+    worker_fn = partial(process_single_episode, path=path, save_path=save_path, cam_keys=cam_keys)
 
-        qpos = []
-        actions = []
-        cam_high = []
-        cam_right_wrist = []
-        cam_left_wrist = []
-        left_arm_dim = []
-        right_arm_dim = []
+    if num_workers <= 1:
+        # Sequential mode (original behaviour)
+        for i in tqdm(range(episode_num), desc="Episodes", unit="ep"):
+            worker_fn(i)
+    else:
+        # Parallel mode
+        effective_workers = min(num_workers, episode_num)
+        # maxtasksperchild: restart each worker after N episodes so that any
+        # memory fragmentation from numpy/cv2/h5py internals is reclaimed by
+        # the OS.  Keeps throughput stable across thousands of episodes.
+        with Pool(processes=effective_workers, maxtasksperchild=50) as pool:
+            for _ in tqdm(
+                pool.imap_unordered(worker_fn, range(episode_num)),
+                total=episode_num,
+                desc=f"Episodes ({effective_workers} workers)",
+                unit="ep",
+            ):
+                pass
 
-        num_steps = left_gripper_all.shape[0]
-        state = None
-
-        # Open source file once and read images one frame at a time to limit memory
-        with h5py.File(episode_path, "r") as root:
-            for j in range(0, num_steps):
-                left_gripper = left_gripper_all[j]
-                left_arm = left_arm_all[j]
-                right_gripper = right_gripper_all[j]
-                right_arm = right_arm_all[j]
-
-                if j != num_steps - 1:
-                    state = np.concatenate((left_arm, [left_gripper], right_arm, [right_gripper]), axis=0)
-                    state = state.astype(np.float32)
-                    qpos.append(state)
-
-                    # Read only this frame from disk (avoids loading full episode images)
-                    frame_bits = read_frame_images(root, cam_keys, j)
-                    camera_high = cv2.imdecode(np.frombuffer(frame_bits["head_camera"], np.uint8), cv2.IMREAD_COLOR)
-                    cam_high.append(cv2.resize(camera_high, (640, 480)))
-                    camera_right_wrist = cv2.imdecode(np.frombuffer(frame_bits["right_camera"], np.uint8), cv2.IMREAD_COLOR)
-                    cam_right_wrist.append(cv2.resize(camera_right_wrist, (640, 480)))
-                    camera_left_wrist = cv2.imdecode(np.frombuffer(frame_bits["left_camera"], np.uint8), cv2.IMREAD_COLOR)
-                    cam_left_wrist.append(cv2.resize(camera_left_wrist, (640, 480)))
-
-                if j != 0:
-                    actions.append(state)
-                    left_arm_dim.append(left_arm.shape[0])
-                    right_arm_dim.append(right_arm.shape[0])
-
-        hdf5path = os.path.join(save_path, f"episode_{i}.hdf5")
-        with h5py.File(hdf5path, "w") as f:
-            f.create_dataset("action", data=np.array(actions))
-            obs = f.create_group("observations")
-            obs.create_dataset("qpos", data=np.array(qpos))
-            obs.create_dataset("left_arm_dim", data=np.array(left_arm_dim))
-            obs.create_dataset("right_arm_dim", data=np.array(right_arm_dim))
-            image = obs.create_group("images")
-            image.create_dataset("cam_high", data=np.stack(cam_high), dtype=np.uint8)
-            image.create_dataset("cam_right_wrist", data=np.stack(cam_right_wrist), dtype=np.uint8)
-            image.create_dataset("cam_left_wrist", data=np.stack(cam_left_wrist), dtype=np.uint8)
-
-        # Explicit cleanup so memory is freed before next episode (avoids blow-up over 1000s of episodes)
-        del qpos, actions, cam_high, cam_right_wrist, cam_left_wrist, left_arm_dim, right_arm_dim
-        del left_gripper_all, left_arm_all, right_gripper_all, right_arm_all
-        gc.collect()
-
-        begin += 1
-
-    return begin
+    return episode_num
 
 
 if __name__ == "__main__":
@@ -140,18 +211,26 @@ if __name__ == "__main__":
     )
     parser.add_argument("task_config", type=str)
     parser.add_argument("expert_data_num", type=int)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for episode processing (default: 1, sequential)",
+    )
 
     args = parser.parse_args()
 
     task_name = args.task_name
     task_config = args.task_config
     expert_data_num = args.expert_data_num
+    num_workers = args.num_workers
 
     begin = 0
     begin = data_transform(
         os.path.join("../../data/", task_name, task_config, 'data'),
         expert_data_num,
         f"processed_data/sim-{task_name}/{task_config}-{expert_data_num}",
+        num_workers=num_workers,
     )
 
     SIM_TASK_CONFIGS_PATH = "./SIM_TASK_CONFIGS.json"
