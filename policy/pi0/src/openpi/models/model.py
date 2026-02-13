@@ -93,6 +93,9 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Reasoning point: normalised (x, y) pick/place target in head-camera pixel space.
+    reasoning_point: at.Float[ArrayT, "*b 2"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -116,6 +119,7 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            reasoning_point=data.get("reasoning_point"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -131,6 +135,10 @@ class Observation(Generic[ArrayT]):
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
+
+
+    # Reasoning point dimension.
+REASONING_POINT_DIM = 2
 
 
 def preprocess_observation(
@@ -195,6 +203,7 @@ def preprocess_observation(
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        reasoning_point=observation.reasoning_point,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

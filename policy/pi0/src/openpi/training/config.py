@@ -409,6 +409,46 @@ _CONFIGS = [
         num_train_steps=30000,
         fsdp_devices=1,  # refer line 359
     ),
+    # pi0_base with reasoning-point conditioning (pick/place) by lora
+    TrainConfig(
+        name="pi0_reasoning_aloha_robotwin_lora",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            reasoning_point_dim=2,
+            reasoning_loss_weight=10.0,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="demo_randomized_place_anyobject_stand_5k",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                    "reasoning_point": "observation.reasoning_point",
+                })
+            ]),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            reasoning_point_dim=2,
+        ).get_freeze_filter(),
+        batch_size=32,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30000,
+        fsdp_devices=1,
+    ),
     # pi0_fast_base by lora
     TrainConfig(
         name="pi0_fast_aloha_robotwin_lora",

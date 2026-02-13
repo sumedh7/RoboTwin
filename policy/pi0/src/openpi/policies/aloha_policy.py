@@ -95,6 +95,10 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Pass through reasoning point if present.
+        if "reasoning_point" in data:
+            inputs["reasoning_point"] = np.asarray(data["reasoning_point"], dtype=np.float32)
+
         return inputs
 
 

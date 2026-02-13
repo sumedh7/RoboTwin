@@ -74,6 +74,11 @@ class Pi0Config(_model.BaseModelConfig):
     action_horizon: int = 50
     max_token_len: int = 48
 
+    # Reasoning point (pick/place target in normalised head-camera pixel space).
+    # Set to 0 to disable reasoning-point conditioning entirely.
+    reasoning_point_dim: int = 0
+    reasoning_loss_weight: float = 10.0
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -87,6 +92,10 @@ class Pi0Config(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        reasoning_spec = None
+        if self.reasoning_point_dim > 0:
+            reasoning_spec = jax.ShapeDtypeStruct([batch_size, self.reasoning_point_dim], jnp.float32)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -103,6 +112,7 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                reasoning_point=reasoning_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -136,6 +146,9 @@ class Pi0(_model.BaseModel):
 
     def __init__(self, config: Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.reasoning_point_dim = config.reasoning_point_dim
+        self.reasoning_loss_weight = config.reasoning_loss_weight
+
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -160,6 +173,11 @@ class Pi0(_model.BaseModel):
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # Reasoning-point projection layers (pick/place target).
+        if config.reasoning_point_dim > 0:
+            self.reasoning_proj = nnx.Linear(config.reasoning_point_dim, action_expert_config.width, rngs=rngs)
+            self.reasoning_out_proj = nnx.Linear(action_expert_config.width, config.reasoning_point_dim, rngs=rngs)
 
     @at.typecheck
     def embed_prefix(
@@ -206,6 +224,14 @@ class Pi0(_model.BaseModel):
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
+
+        # (optional) add reasoning-point token right after state
+        if self.reasoning_point_dim > 0 and obs.reasoning_point is not None:
+            rp_token = self.reasoning_proj(obs.reasoning_point)[:, None, :]
+            tokens.append(rp_token)
+            input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+            # prefix/state do not attend to reasoning; reasoning attends to prefix+state
+            ar_mask += [True]
 
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
@@ -254,7 +280,18 @@ class Pi0(_model.BaseModel):
                                                          positions=positions)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+
+        # Auxiliary reasoning-point prediction loss.
+        if self.reasoning_point_dim > 0 and observation.reasoning_point is not None:
+            # The reasoning token is at suffix position 1 (after state at position 0).
+            reasoning_out = suffix_out[:, 1]
+            reasoning_pred = self.reasoning_out_proj(reasoning_out)  # [b, 2]
+            reasoning_loss = jnp.mean(jnp.square(reasoning_pred - observation.reasoning_point), axis=-1)  # [b]
+            # Broadcast reasoning loss across the action-horizon dim and add.
+            flow_loss = flow_loss + self.reasoning_loss_weight * reasoning_loss[..., None]
+
+        return flow_loss
 
     @override
     def sample_actions(
@@ -270,6 +307,10 @@ class Pi0(_model.BaseModel):
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # If reasoning is enabled but no GT point supplied, predict it.
+        if self.reasoning_point_dim > 0 and observation.reasoning_point is None:
+            observation = self._predict_reasoning_point(observation, noise)
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -314,3 +355,28 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def _predict_reasoning_point(
+        self,
+        observation: _model.Observation,
+        noise: _model.Actions,
+    ) -> _model.Observation:
+        """Run one forward pass with a zero reasoning-point input to predict the point."""
+        batch_size = observation.state.shape[0]
+        # Use a zero placeholder for the reasoning point
+        zero_rp = jnp.zeros((batch_size, self.reasoning_point_dim))
+        obs_with_zero = observation.replace(reasoning_point=zero_rp)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(obs_with_zero)
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+            obs_with_zero, noise, jnp.ones(batch_size))
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions)
+
+        # Reasoning token is at suffix position 1 (after state token at 0)
+        reasoning_pred = self.reasoning_out_proj(suffix_out[:, 1])
+        return observation.replace(reasoning_point=reasoning_pred)
