@@ -1,4 +1,5 @@
 models/
+policy/pi0/training_data/
 data/*
 !data/process_stuck.py
 __pycache__/

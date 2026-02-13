@@ -49,20 +49,23 @@ def main(config_name: str, max_frames: int | None = None):
         num_frames = max_frames
         shuffle = True
 
+    batch_size = 64
+    num_batches = (num_frames + batch_size - 1) // batch_size
+
     data_loader = _data_loader.TorchDataLoader(
         dataset,
-        local_batch_size=8,
+        local_batch_size=batch_size,
         num_workers=8,
         shuffle=shuffle,
-        num_batches=num_frames,
+        num_batches=num_batches,
     )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            values = np.asarray(batch[key][0])
+            values = np.asarray(batch[key])
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}

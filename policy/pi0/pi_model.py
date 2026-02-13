@@ -16,6 +16,7 @@ from openpi.training import data_loader as _data_loader
 
 import cv2
 from PIL import Image
+import os
 
 from openpi.models import model as _model
 from openpi.policies import policy_config as _policy_config

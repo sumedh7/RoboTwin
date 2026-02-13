@@ -51,15 +51,18 @@ def get_task_config(task_name):
     return args
 
 
-def data_transform(path, episode_num, save_path):
+def data_transform(path, episode_num, save_path, start=None, end=None):
     begin = 0
     floders = os.listdir(path)
     # assert episode_num <= len(floders), "data num not enough"
 
     if not os.path.exists(save_path):
-        os.makedirs(save_path)
+        os.makedirs(save_path, exist_ok=True)
 
-    for i in range(episode_num):
+    ep_start = start if start is not None else 0
+    ep_end = end if end is not None else episode_num
+
+    for i in range(ep_start, ep_end):
 
         desc_type = "seen"
         instruction_data_path = os.path.join(path, "instructions", f"episode{i}.json")
@@ -161,6 +164,18 @@ if __name__ == "__main__":
         default=50,
         help="Number of episodes to process (e.g., 50)",
     )
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=None,
+        help="Start episode index (inclusive). Defaults to 0.",
+    )
+    parser.add_argument(
+        "--end",
+        type=int,
+        default=None,
+        help="End episode index (exclusive). Defaults to expert_data_num.",
+    )
     args = parser.parse_args()
 
     task_name = args.task_name
@@ -170,11 +185,15 @@ if __name__ == "__main__":
     load_dir = os.path.join("../../data", str(task_name), str(setting))
 
     begin = 0
-    print(f'read data from path:{os.path.join("data", load_dir)}')
+    start = args.start if args.start is not None else 0
+    end = args.end if args.end is not None else expert_data_num
+    print(f'read data from path:{os.path.join("data", load_dir)}  episodes [{start}, {end})')
 
     target_dir = f"processed_data/{task_name}-{setting}-{expert_data_num}"
     begin = data_transform(
         load_dir,
         expert_data_num,
         target_dir,
+        start=start,
+        end=end,
     )
