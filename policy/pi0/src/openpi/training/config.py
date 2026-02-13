@@ -445,7 +445,10 @@ _CONFIGS = [
             reasoning_point_dim=2,
         ).get_freeze_filter(),
         batch_size=32,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params",
+            missing_regex=".*lora.*|.*reasoning.*",
+        ),
         num_train_steps=30000,
         fsdp_devices=1,
     ),
