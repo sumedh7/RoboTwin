@@ -12,6 +12,21 @@ import envs._GLOBAL_CONFIGS as CONFIGS
 
 try:
     # ********************** CuroboPlanner (optional) **********************
+    # Ensure curobo source is importable (editable install or PYTHONPATH)
+    import sys as _sys
+    _curobo_src = __import__('os').path.join(
+        __import__('os').path.dirname(__file__), '..', 'curobo', 'src')
+    if __import__('os').path.isdir(_curobo_src) and _curobo_src not in _sys.path:
+        _sys.path.insert(0, __import__('os').path.abspath(_curobo_src))
+    # Force system CUDA toolkit (not conda's old nvcc) and relax version checks.
+    import os as _os
+    if _os.path.isdir('/usr/local/cuda'):
+        _os.environ['CUDA_HOME'] = '/usr/local/cuda'
+    try:
+        import torch.utils.cpp_extension as _cpp_ext
+        _cpp_ext._check_cuda_version = lambda *a, **kw: None
+    except Exception:
+        pass
     from curobo.types.math import Pose as CuroboPose
     import time
     from curobo.types.robot import JointState
@@ -272,8 +287,10 @@ try:
     
 except Exception as e:
     print('[planner.py]: Something wrong happened when importing CuroboPlanner! Please check if Curobo is installed correctly. If the problem still exists, you can install Curobo from https://github.com/NVlabs/curobo manually.')
+    print(f'Exception: {e}')
     print('Exception traceback:')
     traceback.print_exc()
+    CuroboPlanner = None  # allow graceful degradation
 
 
 # ********************** MplibPlanner **********************

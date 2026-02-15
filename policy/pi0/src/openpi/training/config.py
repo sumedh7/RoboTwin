@@ -90,6 +90,10 @@ class DataConfig:
     # If true, will disable syncing the dataset from the Hugging Face Hub. Allows training on local-only datasets.
     local_files_only: bool = False
 
+    # Local root directory for the dataset. If provided, will be passed to LeRobotDataset/LeRobotDatasetMetadata
+    # as the `root` parameter, allowing datasets to be loaded from a local directory instead of the HF cache.
+    root: str | None = None
+
 
 class GroupFactory(Protocol):
 
@@ -400,6 +404,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,  # Set to True for prompt by task_name
+                root="/home/ubuntu/demo_randomized_place_anyobject_stand_5k",
             ),
         ),
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora",
@@ -437,6 +442,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,
                 prompt_from_task=True,
+                root="/home/ubuntu/demo_randomized_place_anyobject_stand_5k",
             ),
         ),
         freeze_filter=pi0.Pi0Config(

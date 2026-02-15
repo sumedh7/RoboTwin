@@ -12,7 +12,7 @@ from copy import deepcopy
 import sapien.core as sapien
 import envs._GLOBAL_CONFIGS as CONFIGS
 from envs.utils import transforms
-from .planner import CuroboPlanner
+from .planner import CuroboPlanner  # may be None if curobo unavailable
 import torch.multiprocessing as mp
 
 
