@@ -96,6 +96,10 @@ class Observation(Generic[ArrayT]):
     # Reasoning point: normalised (x, y) pick/place target in head-camera pixel space.
     reasoning_point: at.Float[ArrayT, "*b 2"] | None = None
 
+    # Future DINOv2 embedding: concatenated DINOv2 CLS embeddings of camera images
+    # at the end of the action chunk (precomputed target for auxiliary prediction head).
+    future_dinov2_embedding: at.Float[ArrayT, "*b d"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -120,6 +124,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             reasoning_point=data.get("reasoning_point"),
+            future_dinov2_embedding=data.get("future_dinov2_embedding"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -204,6 +209,7 @@ def preprocess_observation(
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         reasoning_point=observation.reasoning_point,
+        future_dinov2_embedding=observation.future_dinov2_embedding,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
@@ -272,7 +278,11 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        """Returns ``(per_step_loss, info_dict)`` where *info_dict* contains
+        scalar metrics for the individual loss components (e.g.
+        ``flow_loss``, ``reasoning_loss``, ``dinov2_loss``).  Entries that are
+        not applicable should simply be omitted."""
         ...
 
     @abc.abstractmethod

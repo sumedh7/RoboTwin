@@ -171,15 +171,17 @@ def train_step(
         observation: _model.Observation,
         actions: _model.Actions,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss, loss_info = model.compute_loss(rng, observation, actions, train=True)
+        return jnp.mean(chunked_loss), loss_info
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, loss_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -213,6 +215,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **loss_info,
     }
     return new_state, info
 
@@ -288,12 +291,14 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
+        # ── checkpoint saving ─────────────────────────────────────────────
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             if step == config.num_train_steps - 1:
                 _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step + 1)
             else:
                 _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
+    # ── cleanup ───────────────────────────────────────────────────────────
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
 

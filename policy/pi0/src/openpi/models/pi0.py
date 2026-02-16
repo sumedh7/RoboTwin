@@ -79,6 +79,11 @@ class Pi0Config(_model.BaseModelConfig):
     reasoning_point_dim: int = 0
     reasoning_loss_weight: float = 10.0
 
+    # Future DINOv2 embedding prediction head.
+    # Set to 0 to disable.  Typical value: 2304 (= 768 * 3 cameras for ViT-B/14).
+    future_img_embedding_dim: int = 0
+    future_img_embedding_loss_weight: float = 1.0
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -97,6 +102,10 @@ class Pi0Config(_model.BaseModelConfig):
         if self.reasoning_point_dim > 0:
             reasoning_spec = jax.ShapeDtypeStruct([batch_size, self.reasoning_point_dim], jnp.float32)
 
+        future_emb_spec = None
+        if self.future_img_embedding_dim > 0:
+            future_emb_spec = jax.ShapeDtypeStruct([batch_size, self.future_img_embedding_dim], jnp.float32)
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -113,6 +122,7 @@ class Pi0Config(_model.BaseModelConfig):
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 reasoning_point=reasoning_spec,
+                future_dinov2_embedding=future_emb_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -135,8 +145,9 @@ class Pi0Config(_model.BaseModelConfig):
             has_lora = True
 
         if has_lora:
-            # If any lora is used, exclude all lora params.
+            # If any lora is used, exclude all lora params and newly-added heads.
             filters.append(nnx.Not(nnx_utils.PathRegex(".*lora.*")), )
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*future_emb.*")), )
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
@@ -178,6 +189,13 @@ class Pi0(_model.BaseModel):
         if config.reasoning_point_dim > 0:
             self.reasoning_proj = nnx.Linear(config.reasoning_point_dim, action_expert_config.width, rngs=rngs)
             self.reasoning_out_proj = nnx.Linear(action_expert_config.width, config.reasoning_point_dim, rngs=rngs)
+
+        # Future-image DINOv2 embedding prediction head (2-layer MLP).
+        self.future_img_embedding_dim = config.future_img_embedding_dim
+        self.future_img_embedding_loss_weight = config.future_img_embedding_loss_weight
+        if config.future_img_embedding_dim > 0:
+            self.future_emb_proj = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.future_emb_out_proj = nnx.Linear(action_expert_config.width, config.future_img_embedding_dim, rngs=rngs)
 
     @at.typecheck
     def embed_prefix(
@@ -257,7 +275,7 @@ class Pi0(_model.BaseModel):
                      observation: _model.Observation,
                      actions: _model.Actions,
                      *,
-                     train: bool = False) -> at.Float[at.Array, "*b ah"]:
+                     train: bool = False) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -280,7 +298,13 @@ class Pi0(_model.BaseModel):
                                                          positions=positions)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
 
-        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+        # --- per-component losses (all scalars, for logging) ---
+        loss_info: dict[str, at.Array] = {}
+
+        flow_loss_per_step = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+        loss_info["flow_loss"] = jnp.mean(flow_loss_per_step)
+
+        total_loss = flow_loss_per_step
 
         # Auxiliary reasoning-point prediction loss.
         if self.reasoning_point_dim > 0 and observation.reasoning_point is not None:
@@ -288,10 +312,22 @@ class Pi0(_model.BaseModel):
             reasoning_out = suffix_out[:, 1]
             reasoning_pred = self.reasoning_out_proj(reasoning_out)  # [b, 2]
             reasoning_loss = jnp.mean(jnp.square(reasoning_pred - observation.reasoning_point), axis=-1)  # [b]
+            loss_info["reasoning_loss"] = jnp.mean(reasoning_loss)
             # Broadcast reasoning loss across the action-horizon dim and add.
-            flow_loss = flow_loss + self.reasoning_loss_weight * reasoning_loss[..., None]
+            total_loss = total_loss + self.reasoning_loss_weight * reasoning_loss[..., None]
 
-        return flow_loss
+        # Auxiliary future-image DINOv2 embedding prediction loss.
+        if self.future_img_embedding_dim > 0 and observation.future_dinov2_embedding is not None:
+            # Use the *last* action token output which represents the end of the action chunk.
+            last_action_out = suffix_out[:, -1]  # [b, width]
+            emb_hidden = nnx.swish(self.future_emb_proj(last_action_out))
+            emb_pred = self.future_emb_out_proj(emb_hidden)  # [b, future_img_embedding_dim]
+            emb_loss = jnp.mean(jnp.square(emb_pred - observation.future_dinov2_embedding), axis=-1)  # [b]
+            loss_info["dinov2_loss"] = jnp.mean(emb_loss)
+            # Broadcast across the action-horizon dim and add.
+            total_loss = total_loss + self.future_img_embedding_loss_weight * emb_loss[..., None]
+
+        return total_loss, loss_info
 
     @override
     def sample_actions(

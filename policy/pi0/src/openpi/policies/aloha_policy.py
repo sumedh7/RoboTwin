@@ -99,6 +99,10 @@ class AlohaInputs(transforms.DataTransformFn):
         if "reasoning_point" in data:
             inputs["reasoning_point"] = np.asarray(data["reasoning_point"], dtype=np.float32)
 
+        # Pass through precomputed future DINOv2 embedding if present.
+        if "future_dinov2_embedding" in data:
+            inputs["future_dinov2_embedding"] = np.asarray(data["future_dinov2_embedding"], dtype=np.float32)
+
         return inputs
 
 

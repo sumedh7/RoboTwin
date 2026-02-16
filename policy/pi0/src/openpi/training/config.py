@@ -404,7 +404,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,  # Set to True for prompt by task_name
-                root="/home/ubuntu/demo_randomized_place_anyobject_stand_5k",
+                root="/root/demo_randomized_place_anyobject_stand_5k",
             ),
         ),
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora",
@@ -442,7 +442,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 local_files_only=True,
                 prompt_from_task=True,
-                root="/home/ubuntu/demo_randomized_place_anyobject_stand_5k",
+                root="/root/demo_randomized_place_anyobject_stand_5k",
             ),
         ),
         freeze_filter=pi0.Pi0Config(
@@ -454,6 +454,54 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "s3://openpi-assets/checkpoints/pi0_base/params",
             missing_regex=".*lora.*|.*reasoning.*",
+        ),
+        num_train_steps=30000,
+        fsdp_devices=1,
+    ),
+    # pi0_base with reasoning-point + future DINOv2 image embedding prediction by lora
+    TrainConfig(
+        name="pi0_reasoning_dinov2_aloha_robotwin_lora",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            reasoning_point_dim=2,
+            reasoning_loss_weight=10.0,
+            future_img_embedding_dim=2304,  # 768 * 3 cameras (DINOv2 ViT-B/14)
+            future_img_embedding_loss_weight=1.0,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="demo_randomized_place_anyobject_stand_5k",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                    "reasoning_point": "observation.reasoning_point",
+                    "future_dinov2_embedding": "observation.future_dinov2_embedding",
+                })
+            ]),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+                root="/root/demo_randomized_place_anyobject_stand_5k",
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            reasoning_point_dim=2,
+            future_img_embedding_dim=2304,
+        ).get_freeze_filter(),
+        batch_size=32,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params",
+            missing_regex=".*lora.*|.*reasoning.*|.*future_emb.*",
         ),
         num_train_steps=30000,
         fsdp_devices=1,
